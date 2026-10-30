@@ -63,3 +63,25 @@ jobs:
 
           SELECT 'GATEC_PG17_NATIVE_RUNNER_PASS';
           SQL
+
+      - name: Check Cloudflare live baseline
+        shell: bash
+        run: |
+          set -euo pipefail
+          tmp="$(mktemp -d)"
+          trap 'rm -rf "$tmp"' EXIT
+
+          curl -fsS --proto '=https' --tlsv1.2 --max-time 20 \
+            "https://raw.githubusercontent.com/metaharshad/sitemodeai-gatec-pages-pilot/6116273ad1053a0500b0fbca07b4b256373a820f/index.html" \
+            -o "$tmp/baseline"
+
+          echo "3d4792e8990906ce0aa43fd2e50772e10eea493cbea85121cdf09efc7d5f7985  $tmp/baseline" | sha256sum -c -
+
+          curl -fsS --proto '=https' --tlsv1.2 --max-time 20 \
+            -H 'Accept-Encoding: identity' \
+            -H 'Cache-Control: no-cache' \
+            "https://sitemodeai-gatec-pages-pilot.pages.dev/?gatec_check=$(date +%s%N)" \
+            -o "$tmp/live"
+
+          cmp "$tmp/baseline" "$tmp/live"
+          echo "GATEC_CLOUDFLARE_BASELINE_BYTE_EXACT_PASS"
