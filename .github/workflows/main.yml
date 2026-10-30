@@ -1,0 +1,65 @@
+
+name: Gate C - Isolated PostgreSQL 17 QA
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  gatec-pg17:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+
+    steps:
+      - name: Start disposable PostgreSQL 17
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker run -d --name gatec-pg17 \
+            --network none \
+            -e POSTGRES_USER=gatec_qa \
+            -e POSTGRES_PASSWORD=disposable-test-only \
+            -e POSTGRES_DB=gatec_disposable_qa \
+            postgres:17
+
+          for i in {1..30}; do
+            if docker exec gatec-pg17 pg_isready \
+              -U gatec_qa -d gatec_disposable_qa; then
+              break
+            fi
+            sleep 2
+          done
+
+      - name: Verify native PostgreSQL and rollback
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker exec -i gatec-pg17 psql \
+            -U gatec_qa -d gatec_disposable_qa \
+            -v ON_ERROR_STOP=1 <<'SQL'
+          DO $qa$
+          BEGIN
+            IF current_database() <> 'gatec_disposable_qa'
+              OR current_setting('server_version_num')::int < 170000
+            THEN
+              RAISE EXCEPTION 'QA_INSTANCE_INVALID';
+            END IF;
+          END $qa$;
+
+          BEGIN;
+          CREATE TABLE gatec_rollback_canary (id integer);
+          INSERT INTO gatec_rollback_canary VALUES (1);
+          ROLLBACK;
+
+          DO $qa$
+          BEGIN
+            IF to_regclass('public.gatec_rollback_canary') IS NOT NULL
+            THEN
+              RAISE EXCEPTION 'ROLLBACK_FAILED';
+            END IF;
+          END $qa$;
+
+          SELECT 'GATEC_PG17_NATIVE_RUNNER_PASS';
+          SQL
