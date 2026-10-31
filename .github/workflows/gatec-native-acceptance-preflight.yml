@@ -1,0 +1,61 @@
+name: Gate C - Native PostgreSQL 17 Identity Preflight
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: "Enter PREFLIGHT_ONLY (no deployment, no receipts, no Gate C sign-off)"
+        type: string
+        required: true
+        default: "PREFLIGHT_ONLY"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: gatec-native-pg17-preflight
+  cancel-in-progress: false
+
+jobs:
+  native-pg17-identity:
+    if: ${{ inputs.confirm == 'PREFLIGHT_ONLY' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 18
+    env:
+      GATEC_PINNED_SOURCE_SHA: 778502076756886c8357e22d20f0cdea009c2cc2
+    steps:
+      - name: Checkout immutable private Gate C source (read-only)
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          repository: metaharshad/privacystats
+          ref: 778502076756886c8357e22d20f0cdea009c2cc2
+          token: ${{ secrets.GATEC_PRIVATE_SOURCE_TOKEN }}
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Verify exact SHA and prepare dependency without install scripts
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GATEC_PINNED_SOURCE_SHA"
+          test -f package-lock.json
+          test -f scripts/qa/gatec-cloudflare-linux-identity.sh
+          test -f scripts/qa/gatec-pg17-native-socket-preflight.sh
+          bash -n scripts/qa/gatec-cloudflare-linux-identity.sh
+          bash -n scripts/qa/gatec-pg17-native-socket-preflight.sh
+          npm ci --ignore-scripts --omit=dev --no-audit --no-fund --silent
+          echo GATEC_PINNED_SOURCE_AND_SCRIPT_SYNTAX_PASS
+
+      - name: Run actual isolated PG17 and separate Linux identities (no production)
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REPOSITORY" = metaharshad/sitemodeai-gatec-pages-pilot
+          sudo env \
+            "PATH=$PATH" \
+            "GITHUB_ACTIONS=$GITHUB_ACTIONS" \
+            "GITHUB_REPOSITORY=$GITHUB_REPOSITORY" \
+            "GATEC_LINUX_UID_BOOTSTRAP=approved-disposable-only" \
+            "GATEC_PINNED_SOURCE_SHA=$GATEC_PINNED_SOURCE_SHA" \
+            bash scripts/qa/gatec-pg17-native-socket-preflight.sh
+          echo GATEC_PG17_NATIVE_SOCKET_PREFLIGHT_COMPLETE_NOT_FULL_GATE_C
