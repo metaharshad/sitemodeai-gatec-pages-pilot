@@ -1,0 +1,36 @@
+name: Gate C - Pinned Private Source Checks
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check-candidate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Checkout exact Gate C draft candidate (read-only)
+        uses: actions/checkout@v4
+        with:
+          repository: metaharshad/privacystats
+          ref: 41afbeaf169c332fb3145a4eaff8f82806375586
+          token: ${{ secrets.GATEC_PRIVATE_SOURCE_TOKEN }}
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Verify immutable candidate and run isolated source checks
+        shell: bash
+        run: |
+          set -euo pipefail
+          expected=41afbeaf169c332fb3145a4eaff8f82806375586
+          test "$(git rev-parse HEAD)" = "$expected"
+          echo "GATEC_PINNED_PRIVATE_SOURCE_SHA_PASS"
+          node --version
+          node --test \
+            autonomous-repair/gatec-cloudflare-disposable-sequence.test.js \
+            autonomous-repair/gatec-cloudflare-pilot-artifact.test.js \
+            autonomous-repair/gatec-cloudflare-pilot-publisher.test.js \
+            autonomous-repair/gatec-cloudflare-verification-runtime.test.js
+          echo "GATEC_PINNED_SOURCE_ISOLATED_TESTS_PASS_NOT_FULL_GATE_C"
