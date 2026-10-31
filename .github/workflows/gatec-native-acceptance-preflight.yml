@@ -22,13 +22,13 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 18
     env:
-      GATEC_PINNED_SOURCE_SHA: 778502076756886c8357e22d20f0cdea009c2cc2
+      GATEC_PINNED_SOURCE_SHA: a4c94859fa1c65a3af6f4d07a90c0414144d1dd2
     steps:
       - name: Checkout immutable private Gate C source (read-only)
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
           repository: metaharshad/privacystats
-          ref: 778502076756886c8357e22d20f0cdea009c2cc2
+          ref: a4c94859fa1c65a3af6f4d07a90c0414144d1dd2
           token: ${{ secrets.GATEC_PRIVATE_SOURCE_TOKEN }}
           persist-credentials: false
           fetch-depth: 1
