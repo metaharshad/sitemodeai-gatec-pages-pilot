@@ -1,0 +1,56 @@
+
+name: Gate C - Live Provider Verification
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify-provider:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+
+    steps:
+      - name: Verify Cloudflare configuration
+        shell: bash
+        env:
+          CF_TOKEN: ${{ secrets.GATEC_CLOUDFLARE_READ_TOKEN }}
+          CF_ACCOUNT: ${{ vars.GATEC_CLOUDFLARE_ACCOUNT_ID }}
+          DEPLOY_HOOK: ${{ secrets.GATEC_CLOUDFLARE_DEPLOY_HOOK_URL }}
+        run: |
+          set -euo pipefail
+          test -n "$CF_TOKEN"
+          [[ "$CF_ACCOUNT" =~ ^[a-f0-9]{32}$ ]]
+          [[ "$DEPLOY_HOOK" == https://api.cloudflare.com/client/v4/pages/webhooks/deploy_hooks/* ]]
+
+          curl -fsS --proto '=https' --tlsv1.2 \
+            --max-time 30 \
+            -H "Authorization: Bearer $CF_TOKEN" \
+            -o "$RUNNER_TEMP/project.json" \
+            "https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT/pages/projects/sitemodeai-gatec-pages-pilot"
+
+          jq -e '
+            .success == true and
+            .result.name == "sitemodeai-gatec-pages-pilot" and
+            .result.source.config.production_deployments_enabled == false and
+            .result.source.config.preview_deployment_setting == "none"
+          ' "$RUNNER_TEMP/project.json" >/dev/null
+
+          echo "GATEC_CLOUDFLARE_PROVIDER_READ_PASS"
+
+      - name: Verify live baseline bytes
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          curl -fsS --proto '=https' --tlsv1.2 \
+            --max-time 30 \
+            -H 'Cache-Control: no-cache' \
+            -o "$RUNNER_TEMP/live.html" \
+            "https://sitemodeai-gatec-pages-pilot.pages.dev/?gatec_check=$GITHUB_RUN_ID"
+
+          echo "3d4792e8990906ce0aa43fd2e50772e10eea493cbea85121cdf09efc7d5f7985  $RUNNER_TEMP/live.html" | sha256sum -c -
+
+          echo "GATEC_LIVE_BASELINE_VERIFIED"
