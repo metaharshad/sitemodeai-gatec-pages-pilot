@@ -1,8 +1,22 @@
-name: Gate C - Native Canonical Authority Acceptance
+name: Gate C - Native Authority and Worker Boundaries
 on:
   workflow_dispatch:
+    inputs:
+      source_sha:
+        description: "Exact independently reviewed privacystats commit (40 hex characters)"
+        required: true
+        default: "dc73b5744f10aaafe353ada56c5e5e9ea8d64c32"
+        type: string
+      mode:
+        description: "workers checks boundaries only; live performs authorized disposable repair and rollback"
+        required: true
+        default: workers
+        type: choice
+        options:
+          - workers
+          - live
 permissions:
-  contents: read
+  contents: write
 concurrency:
   group: gatec-native-authority
   cancel-in-progress: false
@@ -11,12 +25,13 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 18
     env:
-      GATEC_PINNED_SOURCE_SHA: dc73b5744f10aaafe353ada56c5e5e9ea8d64c32
+      GATEC_PINNED_SOURCE_SHA: ${{ inputs.source_sha }}
+      GATEC_OPERATION_MODE: ${{ inputs.mode }}
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
           repository: metaharshad/privacystats
-          ref: dc73b5744f10aaafe353ada56c5e5e9ea8d64c32
+          ref: ${{ inputs.source_sha }}
           token: ${{ secrets.GATEC_PRIVATE_SOURCE_TOKEN }}
           persist-credentials: false
           fetch-depth: 1
@@ -24,14 +39,26 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          [[ "$GATEC_PINNED_SOURCE_SHA" =~ ^[a-f0-9]{40}$ ]]
           test "$(git rev-parse HEAD)" = "$GATEC_PINNED_SOURCE_SHA"
           npm ci --ignore-scripts --omit=dev --no-audit --no-fund --silent
-          node --test autonomous-repair/gatec-issuer-socket-scope.test.js
-      - name: Canonical native authority and actual restricted UID permission checks
+      - name: Execute selected disposable acceptance
         shell: bash
+        env:
+          GATEC_PILOT_GITHUB_TOKEN: ${{ github.token }}
+          GATEC_READ_GITHUB_TOKEN: ${{ secrets.GATEC_PRIVATE_SOURCE_TOKEN }}
+          GATEC_CLOUDFLARE_READ_TOKEN: ${{ secrets.GATEC_CLOUDFLARE_READ_TOKEN }}
+          GATEC_CLOUDFLARE_DEPLOY_HOOK_URL: ${{ secrets.GATEC_CLOUDFLARE_DEPLOY_HOOK_URL }}
+          GATEC_CLOUDFLARE_ACCOUNT_ID: ${{ vars.GATEC_CLOUDFLARE_ACCOUNT_ID }}
         run: |
           set -euo pipefail
-          cat > "$RUNNER_TEMP/gatec-authority.sh" <<'GATEC_SCRIPT'
+          if [[ "$GATEC_OPERATION_MODE" == live ]]; then
+            test -f scripts/qa/gatec-operational-acceptance.sh
+            sudo env "PATH=$PATH" "GITHUB_ACTIONS=$GITHUB_ACTIONS" "GITHUB_REPOSITORY=$GITHUB_REPOSITORY" "GATEC_LINUX_UID_BOOTSTRAP=approved-disposable-only" "GATEC_PINNED_SOURCE_SHA=$GATEC_PINNED_SOURCE_SHA" "GATEC_PILOT_GITHUB_TOKEN=$GATEC_PILOT_GITHUB_TOKEN" "GATEC_READ_GITHUB_TOKEN=$GATEC_READ_GITHUB_TOKEN" "GATEC_CLOUDFLARE_READ_TOKEN=$GATEC_CLOUDFLARE_READ_TOKEN" "GATEC_CLOUDFLARE_DEPLOY_HOOK_URL=$GATEC_CLOUDFLARE_DEPLOY_HOOK_URL" "GATEC_CLOUDFLARE_ACCOUNT_ID=$GATEC_CLOUDFLARE_ACCOUNT_ID" bash scripts/qa/gatec-operational-acceptance.sh
+            exit
+          fi
+          test "$GATEC_OPERATION_MODE" = workers
+          cat > "$RUNNER_TEMP/gatec-workers.sh" <<'GATEC_SCRIPT'
           #!/usr/bin/env bash
           # Source-aligned disposable Linux/PostgreSQL 17 principal preflight only.
           # Never deploy, authorize a repair, sign a receipt, or assert Gate C accepted.
@@ -50,8 +77,11 @@ jobs:
           if docker container inspect "$name" >/dev/null 2>&1; then echo GATEC_EXISTING_CONTAINER_DENIED >&2; exit 2; fi
           started=0
           secretfile=''
+          att_pid=''
+          iss_pid=''
           cleanup(){
             set +e
+            for worker_pid in "$att_pid" "$iss_pid"; do if [[ -n $worker_pid ]]; then kill "$worker_pid" 2>/dev/null; wait "$worker_pid" 2>/dev/null; fi; done
             if (( started )); then docker rm -f "$name" >/dev/null 2>&1; fi
             if [[ -n $secretfile && -f $secretfile ]]; then shred -u -- "$secretfile" || rm -f -- "$secretfile"; fi
             if [[ -d $root && ! -L $root ]]; then bash scripts/qa/gatec-cloudflare-linux-identity.sh cleanup; fi
@@ -235,6 +265,77 @@ jobs:
           printf "SELECT json_build_object('database',current_database(),'version',current_setting('server_version_num'),'repair_enabled',(SELECT enabled FROM sitemodeai_private.github_repair_control WHERE id),'receipts',(SELECT count(*) FROM sitemodeai_private.github_repair_verified_receipts),'contracts',(SELECT json_agg(contract) FROM sitemodeai_private.gatec_forward_marker));\n" | psql_admin
           echo GATEC_NATIVE_M1_M5G_AUTHORITY_RESTRICTED_UID_ACCEPTANCE_PASS_NOT_LIVE_GATE_C
           
+          # Actual production worker entrypoints under separate OS identities.
+          cp -a autonomous-repair "$deps/autonomous-repair"
+          chown -hR root:root "$deps/autonomous-repair"
+          find "$deps/autonomous-repair" -type d -exec chmod 0755 {} +
+          find "$deps/autonomous-repair" -type f -exec chmod 0644 {} +
+          openssl rand -hex 32 | tr -d '\n' > "$root/attestor/hmac.key"
+          chown smgatec-attestor:smgatec-att-ipc "$root/attestor/hmac.key"
+          chmod 0400 "$root/attestor/hmac.key"
+          cat > "$deps/worker-launch.cjs" <<'JS'
+          const fs=require('node:fs');
+          if(process.env.GATEC_WORKER_ROLE==='attestor'){
+           process.env.SITEMODEAI_ATTESTOR_HMAC_SECRET=fs.readFileSync('/run/sitemodeai-gatec/attestor/hmac.key','utf8');
+          }else{
+           process.env.SITEMODEAI_ISSUER_DATABASE_URL='postgresql://sitemodeai_receipt_issuer:'+fs.readFileSync('/run/sitemodeai-gatec/issuer/issuer.pass','utf8')+'@localhost/sitemodeai_pg17_qa_only';
+          }
+          require('./autonomous-repair/gatec-isolated-worker-server');
+          JS
+          chmod 0644 "$deps/worker-launch.cjs"
+          runuser -u smgatec-attestor -- env -i PATH="$PATH" NODE_PATH="$deps/node_modules" GATEC_WORKER_ROLE=attestor "$nodebin" "$deps/worker-launch.cjs" > "$root/attestor.log" 2>&1 &
+          att_pid=$!
+          runuser -u smgatec-issuer -- env -i PATH="$PATH" NODE_PATH="$deps/node_modules" GATEC_WORKER_ROLE=issuer "$nodebin" "$deps/worker-launch.cjs" > "$root/issuer.log" 2>&1 &
+          iss_pid=$!
+          workers_ready=0
+          for _ in $(seq 1 40); do
+           if [[ -S "$root/attestor/socket" && -S "$root/issuer/socket" ]];then workers_ready=1;break;fi
+           sleep 0.2
+          done
+          ((workers_ready)) || { echo ACTUAL_WORKER_START_FAILED; exit 3; }
+          for secret in "$root/issuer/issuer.pass" "$root/attestor/hmac.key"; do
+           if runuser -u smgatec-runtime -- test -r "$secret"; then echo RUNTIME_WORKER_SECRET_EXPOSED; exit 3;fi
+          done
+          if runuser -u smgatec-issuer -- test -r "$root/attestor/hmac.key";then echo ISSUER_CAN_SIGN;exit 3;fi
+          cat > "$deps/worker-check.cjs" <<'JS'
+          'use strict';
+          const assert=require('node:assert/strict'),net=require('node:net');
+          const {randomUUID}=require('node:crypto');
+          const {createUnixWorkerClient}=require('./autonomous-repair/gatec-unix-worker-client');
+          function rpc(path,msg){return new Promise((resolve,reject)=>{
+           const s=net.createConnection(path);let line='';
+           s.setTimeout(5000,()=>{s.destroy();reject(Error('RPC_TIMEOUT'))});
+           s.on('error',reject);s.on('connect',()=>s.write(JSON.stringify(msg)+'\n'));
+           s.on('data',b=>{line+=b; if(line.includes('\n')){s.destroy();resolve(JSON.parse(line.split('\n')[0]))}});
+          })}
+          (async()=>{
+           if(process.getuid()===46021){
+            const a=createUnixWorkerClient({role:'attestor',expectedUid:46022,socketPath:'/run/sitemodeai-gatec/attestor/socket'});
+            const i=createUnixWorkerClient({role:'issuer',expectedUid:46023,socketPath:'/run/sitemodeai-gatec/issuer/socket'});
+            let r=await a.attest({});assert.equal(r.ok,false);assert.equal(r.reason,'UNTRUSTED_ATTESTATION_REQUEST');
+            r=await rpc('/run/sitemodeai-gatec/attestor/socket',{op:'submit'});assert.equal(r.reason,'WORKER_REQUEST_REJECTED');
+            r=await rpc('/run/sitemodeai-gatec/issuer/socket',{op:'mac'});assert.equal(r.reason,'WORKER_REQUEST_REJECTED');
+            r=await i.submit({hostingProvider:'cloudflare-pages',purpose:'verification',challengeId:randomUUID(),revocationStatus:'good',revocationThisUpdate:null,revocationNextUpdate:null},Buffer.alloc(32));
+            assert.equal(r.ok,false);assert.equal(r.reason,'REVOCATION_STALE');assert.equal(r.receiptId,null);
+            console.log('ACTUAL_ATTESTOR_ENTRYPOINT_AND_ISSUER_SOCKET_DB_REJECTION_PASS');
+           }else{
+            const forbidden=process.getuid()===46022?
+             ['/run/sitemodeai-gatec/issuer/socket','/run/sitemodeai-gatec/pgsocket/.s.PGSQL.5432']:
+             ['/run/sitemodeai-gatec/attestor/socket'];
+            for(const path of forbidden){let err;try{await rpc(path,{op:'probe'})}catch(e){err=e}assert.equal(err?.code,'EACCES');}
+            console.log('ACTUAL_CROSS_WORKER_SOCKET_DENIED_UID:'+process.getuid());
+           }
+          })().catch(e=>{console.error(e.message);process.exitCode=3});
+          JS
+          chmod 0644 "$deps/worker-check.cjs"
+          for account in smgatec-runtime smgatec-attestor smgatec-issuer; do
+           runuser -u "$account" -- env -i PATH="$PATH" NODE_PATH="$deps/node_modules" "$nodebin" "$deps/worker-check.cjs"
+          done
+          kill "$att_pid" "$iss_pid"
+          wait "$att_pid" "$iss_pid" || true
+          printf "SELECT json_build_object('receipts',(SELECT count(*) FROM sitemodeai_private.github_repair_verified_receipts),'revocation_rows',(SELECT count(*) FROM sitemodeai_private.https_revocation_evidence),'repair_enabled',(SELECT enabled FROM sitemodeai_private.github_repair_control));\n" | psql_admin
+          echo GATEC_ACTUAL_WORKER_BOUNDARIES_PASS_NO_LIVE_RECEIPT
+          
           GATEC_SCRIPT
-          bash -n "$RUNNER_TEMP/gatec-authority.sh"
-          sudo env "PATH=$PATH" "GITHUB_ACTIONS=$GITHUB_ACTIONS" "GITHUB_REPOSITORY=$GITHUB_REPOSITORY" "GATEC_LINUX_UID_BOOTSTRAP=approved-disposable-only" "GATEC_PINNED_SOURCE_SHA=$GATEC_PINNED_SOURCE_SHA" bash "$RUNNER_TEMP/gatec-authority.sh"
+          bash -n "$RUNNER_TEMP/gatec-workers.sh"
+          sudo env "PATH=$PATH" "GITHUB_ACTIONS=$GITHUB_ACTIONS" "GITHUB_REPOSITORY=$GITHUB_REPOSITORY" "GATEC_LINUX_UID_BOOTSTRAP=approved-disposable-only" "GATEC_PINNED_SOURCE_SHA=$GATEC_PINNED_SOURCE_SHA" bash "$RUNNER_TEMP/gatec-workers.sh"
