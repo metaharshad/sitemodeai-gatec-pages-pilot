@@ -1,4 +1,4 @@
-name: Gate C - Pinned Private Source Checks
+name: Gate C - Current Candidate Source Verification
 
 on:
   workflow_dispatch:
@@ -7,30 +7,79 @@ permissions:
   contents: read
 
 jobs:
-  check-candidate:
+  verify-current-candidate:
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    timeout-minutes: 12
     steps:
-      - name: Checkout exact Gate C draft candidate (read-only)
-        uses: actions/checkout@v4
+      - name: Resolve exact private Gate C branch commit without exposing token
+        id: resolve
+        shell: bash
+        env:
+          SOURCE_TOKEN: ${{ secrets.GATEC_PRIVATE_SOURCE_TOKEN }}
+        run: |
+          set -euo pipefail
+          test -n "$SOURCE_TOKEN"
+          curl --fail --silent --show-error --proto '=https' --tlsv1.2 \
+            --max-time 25 --retry 2 \
+            -H "Authorization: Bearer $SOURCE_TOKEN" \
+            -H 'Accept: application/vnd.github+json' \
+            'https://api.github.com/repos/metaharshad/privacystats/git/ref/heads/cursor/gatec-integrated-receipt-issuer-b333' \
+            -o "$RUNNER_TEMP/gatec-ref.json"
+          jq -e '.ref == "refs/heads/cursor/gatec-integrated-receipt-issuer-b333" and (.object.sha | test("^[a-f0-9]{40}$"))' \
+            "$RUNNER_TEMP/gatec-ref.json" >/dev/null
+          sha="$(jq -r '.object.sha' "$RUNNER_TEMP/gatec-ref.json")"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "GATEC_CURRENT_SOURCE_SHA=$sha"
+
+      - name: Checkout immutable private source without persisting credentials
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
           repository: metaharshad/privacystats
-          ref: 41afbeaf169c332fb3145a4eaff8f82806375586
+          ref: ${{ steps.resolve.outputs.sha }}
           token: ${{ secrets.GATEC_PRIVATE_SOURCE_TOKEN }}
           persist-credentials: false
           fetch-depth: 1
 
-      - name: Verify immutable candidate and run isolated source checks
+      - name: Verify checked-out commit and install audited-lockfile dependencies without scripts
+        shell: bash
+        env:
+          APPROVED_SOURCE_SHA: ${{ steps.resolve.outputs.sha }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$APPROVED_SOURCE_SHA"
+          test -f package-lock.json
+          npm ci --ignore-scripts --omit=dev --no-audit --no-fund --silent
+          echo "GATEC_EXACT_PRIVATE_HEAD_CHECKOUT_PASS"
+
+      - name: Run current Cloudflare, receipt, rollback and security source regression tests
         shell: bash
         run: |
           set -euo pipefail
-          expected=41afbeaf169c332fb3145a4eaff8f82806375586
-          test "$(git rev-parse HEAD)" = "$expected"
-          echo "GATEC_PINNED_PRIVATE_SOURCE_SHA_PASS"
-          node --version
+          # Capture details privately in the ephemeral runner. Do not print private source
+          # snippets or test fixture records to this publicly visible pilot workflow log.
+          status=0
           node --test \
             autonomous-repair/gatec-cloudflare-disposable-sequence.test.js \
             autonomous-repair/gatec-cloudflare-pilot-artifact.test.js \
             autonomous-repair/gatec-cloudflare-pilot-publisher.test.js \
-            autonomous-repair/gatec-cloudflare-verification-runtime.test.js
-          echo "GATEC_PINNED_SOURCE_ISOLATED_TESTS_PASS_NOT_FULL_GATE_C"
+            autonomous-repair/gatec-cloudflare-authority-adapter.test.js \
+            autonomous-repair/gatec-cloudflare-authority-sequence-contract.test.js \
+            autonomous-repair/gatec-cloudflare-verification-runtime.test.js \
+            autonomous-repair/gatec-cloudflare-source-restoration.test.js \
+            autonomous-repair/gatec-cloudflare-recovery-readback.test.js \
+            autonomous-repair/gatec-cloudflare-pages-readback.test.js \
+            autonomous-repair/gatec-cloudflare-live-body-freshness.test.js \
+            autonomous-repair/gatec-cloudflare-recovery-payload.test.js \
+            autonomous-repair/gatec-cloudflare-attestor-scope.test.js \
+            autonomous-repair/gatec-cloudflare-recovery-runtime.test.js \
+            autonomous-repair/gatec-cloudflare-recovery-digest.test.js \
+            autonomous-repair/gatec-cloudflare-recovery-identity.test.js \
+            scripts/gatec-cloudflare-live-execute.test.js \
+            > "$RUNNER_TEMP/gatec-source-tests.log" 2>&1 || status=$?
+          grep -E '^# (tests|pass|fail|skipped|duration_ms) ' \
+            "$RUNNER_TEMP/gatec-source-tests.log" || true
+          if [ "$status" -ne 0 ]; then
+            echo "GATEC_CURRENT_HEAD_SOURCE_REGRESSION_FAIL_NOT_FULL_GATE_C"
+            exit "$status"
+          fi
+          echo "GATEC_CURRENT_HEAD_SOURCE_REGRESSION_PASS_NOT_FULL_GATE_C"
