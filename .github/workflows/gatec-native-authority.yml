@@ -1,0 +1,240 @@
+name: Gate C - Native Canonical Authority Acceptance
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: gatec-native-authority
+  cancel-in-progress: false
+jobs:
+  authority:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 18
+    env:
+      GATEC_PINNED_SOURCE_SHA: dc73b5744f10aaafe353ada56c5e5e9ea8d64c32
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          repository: metaharshad/privacystats
+          ref: dc73b5744f10aaafe353ada56c5e5e9ea8d64c32
+          token: ${{ secrets.GATEC_PRIVATE_SOURCE_TOKEN }}
+          persist-credentials: false
+          fetch-depth: 1
+      - name: Prepare exact committed source
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GATEC_PINNED_SOURCE_SHA"
+          npm ci --ignore-scripts --omit=dev --no-audit --no-fund --silent
+          node --test autonomous-repair/gatec-issuer-socket-scope.test.js
+      - name: Canonical native authority and actual restricted UID permission checks
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > "$RUNNER_TEMP/gatec-authority.sh" <<'GATEC_SCRIPT'
+          #!/usr/bin/env bash
+          # Source-aligned disposable Linux/PostgreSQL 17 principal preflight only.
+          # Never deploy, authorize a repair, sign a receipt, or assert Gate C accepted.
+          set -euo pipefail
+          umask 077
+          [[ "$GITHUB_ACTIONS" == true && "$GITHUB_REPOSITORY" == metaharshad/sitemodeai-gatec-pages-pilot ]] || { echo GATEC_PILOT_CONTEXT_REQUIRED >&2; exit 2; }
+          [[ "$GATEC_LINUX_UID_BOOTSTRAP" == approved-disposable-only ]] || { echo GATEC_APPROVAL_MISSING >&2; exit 2; }
+          [[ $(id -u) == 0 ]] || { echo GATEC_ROOT_INSTALLER_REQUIRED >&2; exit 2; }
+          for exe in docker openssl getent runuser stat chmod chown; do command -v "$exe" >/dev/null || { echo GATEC_HOST_PREREQUISITE_MISSING >&2; exit 2; }; done
+          [[ -r scripts/qa/gatec-cloudflare-linux-identity.sh ]] || { echo GATEC_SOURCE_MISSING >&2; exit 2; }
+          name=gatec-pg17-authority-acceptance
+          root=/run/sitemodeai-gatec
+          source_sha="$GATEC_PINNED_SOURCE_SHA"
+          [[ $source_sha =~ ^[a-f0-9]{40}$ && $(git -c safe.directory="$PWD" rev-parse HEAD) == "$source_sha" ]] || { echo GATEC_PINNED_SOURCE_DRIFT >&2; exit 2; }
+          [[ ! -e $root && ! -L $root ]] || { echo GATEC_RUNTIME_ALREADY_PRESENT >&2; exit 2; }
+          if docker container inspect "$name" >/dev/null 2>&1; then echo GATEC_EXISTING_CONTAINER_DENIED >&2; exit 2; fi
+          started=0
+          secretfile=''
+          cleanup(){
+            set +e
+            if (( started )); then docker rm -f "$name" >/dev/null 2>&1; fi
+            if [[ -n $secretfile && -f $secretfile ]]; then shred -u -- "$secretfile" || rm -f -- "$secretfile"; fi
+            if [[ -d $root && ! -L $root ]]; then bash scripts/qa/gatec-cloudflare-linux-identity.sh cleanup; fi
+          }
+          trap cleanup EXIT
+          bash scripts/qa/gatec-cloudflare-linux-identity.sh setup
+          pguid=$(docker run --rm --entrypoint /usr/bin/id postgres:17 -u postgres)
+          [[ $pguid =~ ^[0-9]+$ && $pguid -ne 0 ]] || { echo GATEC_POSTGRES_IMAGE_IDENTITY_INVALID >&2; exit 2; }
+          pggid=$(getent group smgatec-db-ipc | cut -d: -f3)
+          [[ $pggid =~ ^[0-9]+$ ]] || { echo GATEC_POSTGRES_GROUP_IDENTITY_INVALID >&2; exit 2; }
+          chown "$pguid:$pggid" "$root/pgsocket"
+          chmod 2750 "$root/pgsocket"
+          secretfile=$(mktemp /tmp/gatec-pg17-config.XXXXXXXX)
+          chmod 0600 "$secretfile"
+          pgpass=$(openssl rand -hex 24)
+          printf 'POSTGRES_PASSWORD=%s\nPOSTGRES_DB=sitemodeai_pg17_qa_only\nPOSTGRES_INITDB_ARGS=--auth-local=scram-sha-256\n' "$pgpass" > "$secretfile"
+          docker run -d --name "$name" --network none --env-file "$secretfile" \
+            --mount "type=bind,src=$root/pgsocket,dst=/var/run/postgresql" \
+            postgres:17 -c "listen_addresses=" -c "unix_socket_directories=/var/run/postgresql" >/dev/null
+          started=1
+          ready=0
+          for _ in $(seq 1 80); do
+            if docker exec -u postgres "$name" pg_isready -q -h /var/run/postgresql -U postgres -d sitemodeai_pg17_qa_only; then ready=1; break; fi
+            sleep 1
+          done
+          (( ready )) || { echo GATEC_PG17_READY_CHECK_FAILED >&2; exit 3; }
+          chown "$pguid:$pggid" "$root/pgsocket"
+          chmod 2750 "$root/pgsocket"
+          bash scripts/qa/gatec-cloudflare-linux-identity.sh verify
+          [[ $(docker inspect -f '{{.HostConfig.NetworkMode}}' "$name") == none ]] || { echo GATEC_PG17_NETWORK_NOT_ISOLATED >&2; exit 3; }
+          psql_admin(){ docker exec -i -u postgres "$name" sh -c 'export PGPASSWORD="$POSTGRES_PASSWORD"; exec psql -q -t -A -X -w -v ON_ERROR_STOP=1 -U postgres -h /var/run/postgresql -d sitemodeai_pg17_qa_only' ; }
+          version=$(printf 'select current_setting('"'"'server_version_num'"'"');\n' | psql_admin | tr -d '[:space:]')
+          [[ $version =~ ^17[0-9]{4}$ ]] || { echo GATEC_PG17_VERSION_MISMATCH >&2; exit 3; }
+          runtime_pass=$(openssl rand -hex 24)
+          issuer_pass=$(openssl rand -hex 24)
+          printf "CREATE ROLE sitemodeai_repair_runtime LOGIN PASSWORD '%s' NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE;\nCREATE ROLE sitemodeai_receipt_issuer LOGIN PASSWORD '%s' NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE;\n" "$runtime_pass" "$issuer_pass" | psql_admin
+          runtime_file=$root/scope/runtime.pass
+          issuer_file=$root/issuer/issuer.pass
+          printf '%s' "$runtime_pass" > "$runtime_file"
+          chown root:smgatec-run "$runtime_file"
+          chmod 0440 "$runtime_file"
+          printf '%s' "$issuer_pass" > "$issuer_file"
+          chown smgatec-issuer:smgatec-iss-ipc "$issuer_file"
+          chmod 0400 "$issuer_file"
+          unset pgpass runtime_pass issuer_pass
+          if runuser -u smgatec-attestor -- test -r "$runtime_file"; then echo GATEC_ATTESTOR_CAN_READ_RUNTIME_DB_SECRET >&2; exit 3; fi
+          if runuser -u smgatec-attestor -- test -r "$issuer_file"; then echo GATEC_ATTESTOR_CAN_READ_ISSUER_DB_SECRET >&2; exit 3; fi
+          if runuser -u smgatec-runtime -- test -r "$issuer_file"; then echo GATEC_RUNTIME_CAN_READ_ISSUER_DB_SECRET >&2; exit 3; fi
+          if runuser -u smgatec-issuer -- test -r "$runtime_file"; then echo GATEC_ISSUER_CAN_READ_RUNTIME_DB_SECRET >&2; exit 3; fi
+          js='const fs=require("node:fs"),{Client}=require("pg");(async()=>{const c=new Client({host:"/run/sitemodeai-gatec/pgsocket",port:5432,database:"sitemodeai_pg17_qa_only",user:process.env.GATEC_PG_ROLE,password:fs.readFileSync(process.env.GATEC_PG_PASSWORD_FILE,"utf8"),connectionTimeoutMillis:4000});try{await c.connect();const r=await c.query("select current_database() db,current_user rol,(select rolsuper from pg_roles where rolname=current_user) is_super,(select rolbypassrls from pg_roles where rolname=current_user) is_bypass, current_setting('\''server_version_num'\'')::int vers");if(r.rows.length!==1||r.rows[0].db!=="sitemodeai_pg17_qa_only"||r.rows[0].rol!==process.env.GATEC_PG_ROLE||r.rows[0].is_super||r.rows[0].is_bypass||r.rows[0].vers<170000)throw Error("ROLE_SCOPE_INVALID");}finally{await c.end().catch(()=>{})}})().catch(()=>{process.exitCode=3})'
+          nodebin=$(command -v node)
+          [[ -d node_modules/pg && -x $nodebin ]] || { echo GATEC_NODE_PG_DEPENDENCY_MISSING >&2; exit 3; }
+          # GitHub's private source checkout can be untraversable to isolated UIDs.
+          # Node's NODE_PATH cannot work if a parent directory denies traversal.
+          # Stage lockfile-installed (npm ci --ignore-scripts) dependencies into an
+          # immutable-to-workers, root-owned, non-secret path inside the ephemeral scope.
+          # Do not chmod/chown the private checkout or expose any signing/DB credentials.
+          deps="$root/deps"
+          install -d -m 0755 -o root -g root "$deps"
+          cp -a -- node_modules "$deps/node_modules"
+          chown -hR root:root "$deps/node_modules"
+          find "$deps/node_modules" -type d -exec chmod 0755 {} +
+          find "$deps/node_modules" -type f -exec chmod go-w {} +
+          [[ $(stat -c %u "$deps/node_modules/pg") == 0 ]] || { echo GATEC_DEPENDENCY_OWNER_UNTRUSTED >&2; exit 3; }
+          for worker in smgatec-runtime smgatec-issuer; do
+            runuser -u "$worker" -- env NODE_PATH="$deps/node_modules" "$nodebin" -e 'require("pg")' \
+              || { echo GATEC_RESTRICTED_PG_DEPENDENCY_UNAVAILABLE >&2; exit 3; }
+          done
+          runuser -u smgatec-runtime -- env GATEC_PG_ROLE=sitemodeai_repair_runtime GATEC_PG_PASSWORD_FILE="$runtime_file" NODE_PATH="$deps/node_modules" "$nodebin" -e "$js"
+          runuser -u smgatec-issuer -- env GATEC_PG_ROLE=sitemodeai_receipt_issuer GATEC_PG_PASSWORD_FILE="$issuer_file" NODE_PATH="$deps/node_modules" "$nodebin" -e "$js"
+          
+          
+          # Disposable canonical authority setup; derive base tables from source native harness.
+          printf '%s\n' 'CREATE ROLE anon NOLOGIN; CREATE ROLE authenticated NOLOGIN; CREATE ROLE service_role NOLOGIN; CREATE ROLE sitemodeai_repair_migration_owner NOLOGIN NOINHERIT NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE;' | psql_admin
+          python3 - <<'PY' > "$root/bootstrap.sql"
+          from pathlib import Path
+          s=Path('autonomous-repair/gatec-native-receipt.test.js').read_text()
+          start=s.index("psql(DB, ['-c', "+chr(96))+len("psql(DB, ['-c', "+chr(96))
+          sql=s[start:s.index(chr(96)+"]);",start)]
+          assert 'CREATE TABLE public.accounts' in sql and 'CREATE TABLE sitemodeai_private.github_seo_bindings' in sql
+          print(sql.replace(chr(36)+'{DB}','sitemodeai_pg17_qa_only'))
+          PY
+          psql_admin < "$root/bootstrap.sql"
+          { printf 'SET ROLE sitemodeai_repair_migration_owner;\n'; cat docs/autonomous-repair-engine/sql/mission2v-github-repair-authority-REVIEW-ONLY.sql; } | psql_admin
+          echo GATEC_CANONICAL_BASE_NATIVE_INSTALLED
+          sqlroot=docs/autonomous-repair-engine/sql
+          for migration in \
+           gatec-m1-canonical-forward-REVIEW-ONLY.sql \
+           gatec-m2-separation-binding-REVIEW-ONLY.sql \
+           gatec-m3-revocation-evidence-REVIEW-ONLY.sql \
+           gatec-m4-github-pages-pilot-REVIEW-ONLY.sql \
+           gatec-m5a-cloudflare-recovery-primitives-REVIEW-ONLY.sql \
+           gatec-m5a-cloudflare-digest-REVIEW-ONLY.sql \
+           gatec-m5b-cloudflare-recovery-scope-REVIEW-ONLY.sql \
+           gatec-m5c-cloudflare-recovery-challenge-REVIEW-ONLY.sql \
+           gatec-m5d-cloudflare-receipt-finalizer-REVIEW-ONLY.sql \
+           gatec-m5e-cloudflare-verification-REVIEW-ONLY.sql \
+           gatec-m5f-cloudflare-publish-recovery-REVIEW-ONLY.sql; do
+           psql_admin < "$sqlroot/$migration"
+           printf 'NATIVE_AUTHORITY_INSTALLED:%s\n' "$migration"
+          done
+          psql_admin <<'SQL'
+          DO $check$
+          BEGIN
+           IF EXISTS(
+           SELECT 1 FROM pg_roles worker CROSS JOIN pg_roles target
+           WHERE worker.rolname IN ('sitemodeai_repair_runtime','sitemodeai_receipt_issuer','sitemodeai_https_attestor')
+           AND target.rolname IN ('sitemodeai_repair_migration_owner','sitemodeai_repair_authority_owner','sitemodeai_attestor_key_owner','sitemodeai_repair_runtime','sitemodeai_receipt_issuer','sitemodeai_https_attestor')
+           AND worker.oid<>target.oid AND pg_has_role(worker.oid,target.oid,'MEMBER')
+           ) THEN RAISE EXCEPTION 'WORKER_PRIVILEGED_MEMBERSHIP'; END IF;
+           IF (SELECT nspowner FROM pg_namespace WHERE nspname='sitemodeai_private') <>
+           (SELECT oid FROM pg_roles WHERE rolname='sitemodeai_repair_migration_owner')
+           THEN RAISE EXCEPTION 'UNTRUSTED_SCHEMA_OWNER'; END IF;
+           IF EXISTS(SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
+           WHERE n.nspname='sitemodeai_private' AND c.relkind='r' AND NOT c.relrowsecurity
+           AND c.relname IN ('github_repair_execution_state','github_repair_execution_events','github_repair_verified_receipts','github_repair_consents','github_repair_control','github_repair_operation_steps','github_repair_host_authority','github_repair_recovery_nonces','github_repair_schema_versions','https_observation_challenges','https_attestor_hmac_keys','https_revocation_evidence','gatec_cloudflare_recovery_challenge_bindings'))
+           THEN RAISE EXCEPTION 'PRIVATE_TABLE_RLS_MISSING'; END IF;
+          END
+          $check$;
+          SQL
+          
+          cat > "$deps/authority-check.cjs" <<'JS'
+          'use strict';
+          const fs=require('node:fs'),assert=require('node:assert/strict'),{Client}=require('pg');
+          (async()=>{
+           const role=process.env.GATEC_PG_ROLE;
+           const runtime=role==='sitemodeai_repair_runtime';
+           assert.equal(process.getuid(),runtime?46021:46023);
+           const c=new Client({host:'/run/sitemodeai-gatec/pgsocket',port:5432,database:'sitemodeai_pg17_qa_only',user:role,password:fs.readFileSync(process.env.GATEC_PG_PASSWORD_FILE,'utf8'),connectionTimeoutMillis:4000});
+           await c.connect();
+           const denied=async(sql)=>{let err;try{await c.query(sql)}catch(e){err=e}assert.equal(err?.code,'42501',sql);};
+           try{
+            for(const sql of [
+             'SELECT secret FROM sitemodeai_private.https_attestor_hmac_keys',
+             'SELECT token_ciphertext FROM sitemodeai_private.github_seo_bindings',
+             "UPDATE sitemodeai_private.github_seo_bindings SET full_name='unauthorized'",
+             "INSERT INTO sitemodeai_private.github_repair_verified_receipts(receipt_id) VALUES ('forgedreceipt000001')",
+             'SET ROLE sitemodeai_repair_migration_owner',
+             'SET ROLE sitemodeai_attestor_key_owner',
+             'SET ROLE '+(runtime?'sitemodeai_receipt_issuer':'sitemodeai_repair_runtime'),
+             'UPDATE sitemodeai_private.github_repair_control SET enabled=true WHERE id'
+            ])await denied(sql);
+            const functions=JSON.parse(fs.readFileSync('/run/sitemodeai-gatec/deps/grants.json','utf8'));
+            for(const f of functions){
+             const allowed=process.env.GATEC_GRANTS_PHASE==='after'&&f.role===role;
+             const r=await c.query("SELECT has_function_privilege(current_user,$1,'EXECUTE') ok",[f.signature]);
+             assert.equal(r.rows[0].ok,allowed,f.signature);
+             if(!allowed){
+              const sig=f.signature,types=sig.slice(sig.indexOf('(')+1,-1).split(',');
+              await denied('SELECT '+sig.slice(0,sig.indexOf('('))+'('+types.map(t=>'NULL::'+t).join(',')+')');
+             }
+            }
+            if(process.env.GATEC_GRANTS_PHASE==='after'){
+             const sig=functions.find(f=>f.role===role).signature;
+             const types=sig.slice(sig.indexOf('(')+1,-1).split(',');
+             const r=await c.query('SELECT '+sig.slice(0,sig.indexOf('('))+'('+types.map(t=>'NULL::'+t).join(',')+') result');
+             assert.equal(r.rows[0].result.ok,false);
+            }
+            console.log('NATIVE_RESTRICTED_UID_DENIALS_PASS:'+role+':'+process.env.GATEC_GRANTS_PHASE);
+           }finally{await c.end()}
+          })().catch(e=>{console.error(e.message);process.exitCode=3});
+          JS
+          python3 - <<'PY' > "$deps/grants.json"
+          from pathlib import Path
+          import re,json
+          s=Path('docs/autonomous-repair-engine/sql/gatec-m5g-disposable-least-privilege-REVIEW-ONLY.sql').read_text()
+          g=re.findall(r'GRANT EXECUTE ON FUNCTION (\S+) TO (\w+);',s)
+          assert len(g)==13
+          print(json.dumps([{'signature':f,'role':r} for f,r in g]))
+          PY
+          chmod 0644 "$deps/authority-check.cjs" "$deps/grants.json"
+          check_workers(){
+           for record in smgatec-runtime:sitemodeai_repair_runtime:scope/runtime.pass smgatec-issuer:sitemodeai_receipt_issuer:issuer/issuer.pass; do
+            account=${record%%:*}; rest=${record#*:}; role=${rest%%:*}; passfile=${rest#*:}
+            runuser -u "$account" -- env GATEC_PG_ROLE="$role" GATEC_PG_PASSWORD_FILE="$root/$passfile" GATEC_GRANTS_PHASE="$1" NODE_PATH="$deps/node_modules" "$nodebin" "$deps/authority-check.cjs"
+           done
+          }
+          check_workers before
+          psql_admin < "$sqlroot/gatec-m5g-disposable-least-privilege-REVIEW-ONLY.sql"
+          check_workers after
+          printf "SELECT json_build_object('database',current_database(),'version',current_setting('server_version_num'),'repair_enabled',(SELECT enabled FROM sitemodeai_private.github_repair_control WHERE id),'receipts',(SELECT count(*) FROM sitemodeai_private.github_repair_verified_receipts),'contracts',(SELECT json_agg(contract) FROM sitemodeai_private.gatec_forward_marker));\n" | psql_admin
+          echo GATEC_NATIVE_M1_M5G_AUTHORITY_RESTRICTED_UID_ACCEPTANCE_PASS_NOT_LIVE_GATE_C
+          
+          GATEC_SCRIPT
+          bash -n "$RUNNER_TEMP/gatec-authority.sh"
+          sudo env "PATH=$PATH" "GITHUB_ACTIONS=$GITHUB_ACTIONS" "GITHUB_REPOSITORY=$GITHUB_REPOSITORY" "GATEC_LINUX_UID_BOOTSTRAP=approved-disposable-only" "GATEC_PINNED_SOURCE_SHA=$GATEC_PINNED_SOURCE_SHA" bash "$RUNNER_TEMP/gatec-authority.sh"
